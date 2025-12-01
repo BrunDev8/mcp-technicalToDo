@@ -1,0 +1,30 @@
+# Archivos de entorno con credenciales sensibles
+.env
+
+# Dependencias
+node_modules/
+
+# Archivos de compilación
+dist/
+build/
+*.js.map
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporal
+*.tmp
+.cache/
