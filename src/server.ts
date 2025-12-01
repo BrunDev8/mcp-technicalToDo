@@ -2,472 +2,444 @@ import 'dotenv/config';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-CallToolRequestSchema,
-ListToolsRequestSchema,
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import pkg from 'pg';
-const { Pool } = pkg;
 
-interface CreateItemArgs {
-    listId: number;
-    name: string;
-    description: string;
+const API_BASE = process.env.API_BASE || "http://localhost:5083";
+const DEFAULT_TIMEOUT_MS = 8000;
+
+// Types for better type safety
+interface ApiFetchResponse {
+  ok: boolean;
+  status?: number;
+  body?: any;
+  message?: string;
+  isTimeout?: boolean;
 }
 
-interface UpdateItemArgs {
-    itemId: number;
-    name?: string;
-    description?: string;
-    isComplete?: boolean;
-}
+// Helper: fetch with timeout and error handling
+async function apiFetch(
+  method: string,
+  path: string,
+  body?: any,
+  expectedStatus: number = 200
+): Promise<ApiFetchResponse> {
+  const url = `${API_BASE}${path}`;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
 
-interface CompleteItemArgs {
-    itemId: number;
-}
-
-interface DeleteItemArgs {
-    itemId: number;
-}
-
-interface CreateListArgs {
-    name: string;
-}
-
-// Estructura de datos basada en las tablas de la BD
-interface Item {
-    id: number;
-    name: string;
-    description: string;
-    iscomplete: boolean;
-    listid: number;
-}
-
-interface List {
-    id: number;
-    name: string;
-}
-
-// Configuración de conexión a PostgreSQL
-const pool = new Pool({
-    user: process.env.DB_USER || 'postgres',
-    host: process.env.DB_HOST || 'localhost',
-    database: process.env.DB_NAME || 'postgres',
-    password: process.env.DB_PASSWORD || 'your_password',
-    port: parseInt(process.env.DB_PORT || '5432'),
-});
-
-const server = new Server(
-    {
-        name: "mcp-technicaltodo",
-        version: "0.0.1",
+  const init: RequestInit = {
+    method,
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json",
     },
-    {
-        capabilities: {
-            tools: {},
-        },
-    },
-);
-//Register herramienta disponibles
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+    signal: controller.signal,
+  };
+  
+  if (body !== undefined) {
+    init.body = JSON.stringify(body);
+  }
+
+  try {
+    const res = await fetch(url, init);
+    clearTimeout(timeoutId);
+
+    let text = "";
+    try {
+      text = await res.text();
+    } catch (e) {
+      // Ignore text parsing errors
+    }
+
+    let json;
+    try {
+      json = text ? JSON.parse(text) : undefined;
+    } catch (e) {
+      json = undefined;
+    }
+
+    if (res.status >= 200 && res.status < 300) {
+      return { ok: true, status: res.status, body: json ?? text };
+    } else {
+      return {
+        ok: false,
+        status: res.status,
+        body: json ?? text,
+        message: `HTTP ${res.status} on ${method} ${url}`,
+      };
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err instanceof Error && err.name === "AbortError") {
+      return {
+        ok: false,
+        isTimeout: true,
+        message: `Request timeout (${DEFAULT_TIMEOUT_MS}ms) to ${method} ${url}`,
+      };
+    }
     return {
-        tools: [
-            {
-                name: "create_item",
-                description: "Creates a new to-do item in a specific list.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        listId: { type: "number", description: "The ID of the list where the item will be created." },
-                        name: { type: "string", description: "The name of the to-do item." },
-                        description: { type: "string", description: "The description of the to-do item." },
-                    },
-                    required: ["listId", "name", "description"],
-                },
-            },
-            {
-                name: "update_item",
-                description: "Updates an existing to-do item (e.g., change its name or description).",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        itemId: { type: "number", description: "The ID of the item to update." },
-                        name: { type: "string", description: "The new name for the item." },
-                        description: { type: "string", description: "The new description for the item." },
-                        isComplete: { type: "boolean", description: "Whether the item is complete." },
-                    },
-                    required: ["itemId"],
-                },
-            },
-            {
-                name: "complete_item",
-                description: "Marks a to-do item as completed.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        itemId: { type: "number", description: "The ID of the item to complete." },
-                    },
-                    required: ["itemId"],
-                },
-            },
-            {
-                name: "delete_item",
-                description: "Deletes a to-do item from a list.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        itemId: { type: "number", description: "The ID of the item to delete." },
-                    },
-                    required: ["itemId"],
-                },
-            },
-            {
-                name: "create_list",
-                description: "Creates a new to-do list.",
-                inputSchema: {
-                    type: "object",
-                    properties: {
-                        name: { type: "string", description: "The name of the new list." },
-                    },
-                    required: ["name"],
-                },
-            },
-            {
-                name: "get_lists",
-                description: "Retrieves all to-do lists with their items.",
-                inputSchema: {
-                    type: "object",
-                    properties: {},
-                },
-            },
-        ],
+      ok: false,
+      message: err instanceof Error ? err.message : String(err),
     };
-});
-
-//Handle tool requests
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const {name, arguments: args} = request.params;
-
-    // Crear un ítem en una lista específica
-    if (name === "create_item") {
-        const { listId, name: itemName, description } = args as unknown as CreateItemArgs;
-        
-        try {
-            // Verificar que la lista existe
-            const listCheck = await pool.query('SELECT id, name FROM "List" WHERE id = $1', [listId]);
-            if (listCheck.rows.length === 0) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Error: List with ID '${listId}' not found. Please create the list first.`,
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-
-            // Insertar el nuevo ítem
-            const result = await pool.query(
-                'INSERT INTO "Item" ("Name", "Description", "IsComplete", "ListId") VALUES ($1, $2, $3, $4) RETURNING *',
-                [itemName, description, false, listId]
-            );
-
-            const newItem = result.rows[0];
-            const listName = listCheck.rows[0].name;
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Item created successfully!\nID: ${newItem.id}\nName: ${newItem.Name}\nDescription: ${newItem.Description}\nList: ${listName}`,
-                    },
-                ],
-            };
-        } catch (error) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Error creating item: ${error instanceof Error ? error.message : String(error)}`,
-                    },
-                ],
-                isError: true,
-            };
-        }
-    }
-
-    // Actualizar un ítem existente
-    if (name === "update_item") {
-        const { itemId, name: itemName, description, isComplete } = args as unknown as UpdateItemArgs;
-        
-        try {
-            // Verificar que el ítem existe
-            const itemCheck = await pool.query('SELECT * FROM "Item" WHERE id = $1', [itemId]);
-            if (itemCheck.rows.length === 0) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Error: Item with ID '${itemId}' not found.`,
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-
-            // Construir la consulta de actualización dinámicamente
-            const updates: string[] = [];
-            const values: any[] = [];
-            let paramIndex = 1;
-
-            if (itemName !== undefined) {
-                updates.push(`"Name" = $${paramIndex}`);
-                values.push(itemName);
-                paramIndex++;
-            }
-            if (description !== undefined) {
-                updates.push(`"Description" = $${paramIndex}`);
-                values.push(description);
-                paramIndex++;
-            }
-            if (isComplete !== undefined) {
-                updates.push(`"IsComplete" = $${paramIndex}`);
-                values.push(isComplete);
-                paramIndex++;
-            }
-
-            if (updates.length === 0) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "No fields to update. Please provide at least one field (name, description, or isComplete).",
-                        },
-                    ],
-                };
-            }
-
-            values.push(itemId);
-            const query = `UPDATE "Item" SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`;
-            const result = await pool.query(query, values);
-            const updatedItem = result.rows[0];
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Item updated successfully!\nID: ${updatedItem.id}\nName: ${updatedItem.Name}\nDescription: ${updatedItem.Description}\nCompleted: ${updatedItem.IsComplete}`,
-                    },
-                ],
-            };
-        } catch (error) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Error updating item: ${error instanceof Error ? error.message : String(error)}`,
-                    },
-                ],
-                isError: true,
-            };
-        }
-    }
-
-    // Completar un ítem (marcarlo como finalizado)
-    if (name === "complete_item") {
-        const { itemId } = args as unknown as CompleteItemArgs;
-        
-        try {
-            const result = await pool.query(
-                'UPDATE "Item" SET "IsComplete" = true WHERE id = $1 RETURNING *',
-                [itemId]
-            );
-
-            if (result.rows.length === 0) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Error: Item with ID '${itemId}' not found.`,
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-
-            const completedItem = result.rows[0];
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Item marked as completed! ✓\nID: ${completedItem.id}\nName: ${completedItem.Name}\nDescription: ${completedItem.Description}`,
-                    },
-                ],
-            };
-        } catch (error) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Error completing item: ${error instanceof Error ? error.message : String(error)}`,
-                    },
-                ],
-                isError: true,
-            };
-        }
-    }
-
-    // Eliminar un ítem de una lista
-    if (name === "delete_item") {
-        const { itemId } = args as unknown as DeleteItemArgs;
-        
-        try {
-            // Obtener información del ítem antes de eliminarlo
-            const itemQuery = await pool.query(
-                'SELECT i.*, l.name as list_name FROM "Item" i JOIN "List" l ON i."ListId" = l.id WHERE i.id = $1',
-                [itemId]
-            );
-
-            if (itemQuery.rows.length === 0) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `Error: Item with ID '${itemId}' not found.`,
-                        },
-                    ],
-                    isError: true,
-                };
-            }
-
-            const deletedItem = itemQuery.rows[0];
-
-            // Eliminar el ítem
-            await pool.query('DELETE FROM "Item" WHERE id = $1', [itemId]);
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Item deleted successfully!\nDeleted item: ${deletedItem.Name}\nFrom list: ${deletedItem.list_name}`,
-                    },
-                ],
-            };
-        } catch (error) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Error deleting item: ${error instanceof Error ? error.message : String(error)}`,
-                    },
-                ],
-                isError: true,
-            };
-        }
-    }
-
-    // Crear una nueva lista
-    if (name === "create_list") {
-        const { name: listName } = args as unknown as CreateListArgs;
-        
-        try {
-            const result = await pool.query(
-                'INSERT INTO "List" (name) VALUES ($1) RETURNING *',
-                [listName]
-            );
-
-            const newList = result.rows[0];
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `List created successfully!\nID: ${newList.id}\nName: ${newList.name}`,
-                    },
-                ],
-            };
-        } catch (error) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Error creating list: ${error instanceof Error ? error.message : String(error)}`,
-                    },
-                ],
-                isError: true,
-            };
-        }
-    }
-
-    // Obtener todas las listas
-    if (name === "get_lists") {
-        try {
-            const listsResult = await pool.query('SELECT * FROM "List" ORDER BY id');
-            
-            if (listsResult.rows.length === 0) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "No lists found. Create a list first using 'create_list'.",
-                        },
-                    ],
-                };
-            }
-
-            let result = "📋 To-Do Lists:\n\n";
-            
-            for (const list of listsResult.rows) {
-                const itemsResult = await pool.query(
-                    'SELECT * FROM "Item" WHERE "ListId" = $1 ORDER BY id',
-                    [list.id]
-                );
-
-                result += `List: ${list.name} (ID: ${list.id})\n`;
-                
-                if (itemsResult.rows.length === 0) {
-                    result += "  No items yet.\n";
-                } else {
-                    itemsResult.rows.forEach((item: any, index: number) => {
-                        const status = item.IsComplete ? "✓" : "○";
-                        result += `  ${index + 1}. [${status}] ${item.Name} - ${item.Description} (ID: ${item.id})\n`;
-                    });
-                }
-                result += "\n";
-            }
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: result,
-                    },
-                ],
-            };
-        } catch (error) {
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Error retrieving lists: ${error instanceof Error ? error.message : String(error)}`,
-                    },
-                ],
-                isError: true,
-            };
-        }
-    }
-
-    throw new Error(`Unknown tool: ${name}`);
-});   
-    
-//Iniciar el servidor con transporte stdio
-async function main(): Promise<void> {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
+  }
 }
 
-main().catch((error) => {
-    console.error("Error starting server:", error);
-    process.exit(1);
+// Helper: format error response
+function errorResponse(message: string) {
+  return { content: [{ type: "text" as const, text: message }], isError: true };
+}
+
+// Helper: format success response
+function successResponse(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+
+// Helper: get field value with fallback for different naming conventions
+function getField(obj: any, ...fields: string[]): any {
+  for (const field of fields) {
+    if (obj[field] !== undefined) return obj[field];
+  }
+  return undefined;
+}
+
+// Initialize MCP Server
+const server = new Server(
+  {
+    name: "mcp-technicaltodo",
+    version: "0.0.1",
+  },
+  {
+    capabilities: {
+      tools: {},
+    },
+  }
+);
+
+// Registrar lista de herramientas (ListTools)
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return {
+    tools: [
+      {
+        name: "create_item",
+        description: "Creates a new to-do item in a specific list.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            listId: { type: "number", description: "The ID of the list where the item will be created." },
+            name: { type: "string", description: "The name of the to-do item." },
+            description: { type: "string", description: "The description of the to-do item." },
+          },
+          required: ["listId", "name"],
+        },
+      },
+      {
+        name: "update_item",
+        description: "Updates an existing to-do item (e.g., change its name or description).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            itemId: { type: "number", description: "The ID of the item to update." },
+            name: { type: "string", description: "The new name for the item." },
+            description: { type: "string", description: "The new description for the item." },
+            isComplete: { type: "boolean", description: "Whether the item is complete." },
+          },
+          required: ["itemId"],
+        },
+      },
+      {
+        name: "complete_item",
+        description: "Marks a to-do item as completed.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            itemId: { type: "number", description: "The ID of the item to complete." },
+          },
+          required: ["itemId"],
+        },
+      },
+      {
+        name: "delete_item",
+        description: "Deletes a to-do item from a list.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            itemId: { type: "number", description: "The ID of the item to delete." },
+          },
+          required: ["itemId"],
+        },
+      },
+      {
+        name: "create_list",
+        description: "Creates a new to-do list.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "The name of the new list." },
+          },
+          required: ["name"],
+        },
+      },
+      {
+        name: "get_lists",
+        description: "Retrieves all to-do lists with their items.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "get_items",
+        description: "Get all items or items in a specific list (optional listId).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            listId: { type: "number", description: "Optional listId to filter items." },
+          },
+        },
+      },
+      {
+        name: "get_item",
+        description: "Get a single item by id.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            itemId: { type: "number", description: "The ID of the item." },
+          },
+          required: ["itemId"],
+        },
+      },
+    ],
+  };
+});
+
+// Handler principal de llamadas a tools
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  // --- create_item: POST /api/items
+  if (name === "create_item") {
+    const { listId, name: itemName, description } = args as any;
+    if (!listId || !itemName) {
+      return errorResponse("Missing required fields: listId and name.");
+    }
+
+    const payload = {
+      ListId: listId,
+      Name: itemName,
+      Description: description ?? "",
+      IsComplete: false,
+    };
+
+    const res = await apiFetch("POST", "/api/items", payload, 201);
+    if (!res.ok) {
+      const errText = res.message ?? JSON.stringify(res.body ?? res);
+      return errorResponse(`Error creating item: ${errText}`);
+    }
+
+    const created = res.body;
+    const id = getField(created, "id", "Id");
+    const name = getField(created, "name", "Name", "title", "Title");
+    const listIdVal = getField(created, "listId", "ListId");
+    
+    return successResponse(
+      `Item created successfully.\nID: ${id}\nName: ${name}\nListId: ${listIdVal}`
+    );
+  }
+
+  // --- update_item: PUT /api/items/{id}
+  if (name === "update_item") {
+    const { itemId, name: itemName, description, isComplete } = args as any;
+    if (!itemId) {
+      return errorResponse("Missing required field: itemId.");
+    }
+
+    const payload: any = {};
+    if (itemName !== undefined) payload.Name = itemName;
+    if (description !== undefined) payload.Description = description;
+    if (isComplete !== undefined) payload.IsComplete = isComplete;
+
+    if (Object.keys(payload).length === 0) {
+      return successResponse("No fields to update. Provide name, description or isComplete.");
+    }
+
+    const res = await apiFetch("PUT", `/api/items/${encodeURIComponent(itemId)}`, payload);
+    if (!res.ok) {
+      const errText = res.message ?? JSON.stringify(res.body ?? res);
+      return errorResponse(`Error updating item: ${errText}`);
+    }
+
+    const updated = res.body;
+    const id = getField(updated, "id", "Id");
+    const name = getField(updated, "name", "Name", "title", "Title");
+    const completed = getField(updated, "isComplete", "IsComplete");
+    
+    return successResponse(
+      `Item updated successfully.\nID: ${id}\nName: ${name}\nCompleted: ${completed}`
+    );
+  }
+
+  // --- complete_item: mark as completed
+  if (name === "complete_item") {
+    const { itemId } = args as any;
+    if (!itemId) {
+      return errorResponse("Missing required field: itemId.");
+    }
+
+    const res = await apiFetch("PUT", `/api/items/${encodeURIComponent(itemId)}`, { IsComplete: true });
+    if (!res.ok) {
+      const errText = res.message ?? JSON.stringify(res.body ?? res);
+      return errorResponse(`Error completing item: ${errText}`);
+    }
+
+    const completed = res.body;
+    const id = getField(completed, "id", "Id");
+    const name = getField(completed, "name", "Name", "title", "Title");
+    
+    return successResponse(`Item marked as completed.\nID: ${id}\nName: ${name}`);
+  }
+
+  // --- delete_item: DELETE /api/items/{id}
+  if (name === "delete_item") {
+    const { itemId } = args as any;
+    if (!itemId) {
+      return errorResponse("Missing required field: itemId.");
+    }
+
+    const res = await apiFetch("DELETE", `/api/items/${encodeURIComponent(itemId)}`);
+    if (!res.ok) {
+      const errText = res.message ?? JSON.stringify(res.body ?? res);
+      return errorResponse(`Error deleting item: ${errText}`);
+    }
+
+    return successResponse(`Item deleted successfully. ID: ${itemId}`);
+  }
+
+  // --- create_list: POST /api/lists
+  if (name === "create_list") {
+    const { name: listName } = args as any;
+    if (!listName) {
+      return errorResponse("Missing required field: name.");
+    }
+
+    const res = await apiFetch("POST", `/api/lists`, { Name: listName }, 201);
+    if (!res.ok) {
+      const errText = res.message ?? JSON.stringify(res.body ?? res);
+      return errorResponse(`Error creating list: ${errText}`);
+    }
+
+    const created = res.body;
+    const id = getField(created, "id", "Id");
+    const name = getField(created, "name", "Name");
+    
+    return successResponse(`List created successfully.\nID: ${id}\nName: ${name}`);
+  }
+
+  // --- get_lists: GET /api/lists with items
+  if (name === "get_lists") {
+    const res = await apiFetch("GET", "/api/lists");
+    if (!res.ok) {
+      const errText = res.message ?? JSON.stringify(res.body ?? res);
+      return errorResponse(`Error retrieving lists: ${errText}`);
+    }
+
+    const lists = res.body;
+    if (!Array.isArray(lists) || lists.length === 0) {
+      return successResponse("No lists available.");
+    }
+
+    let out = "📋 To-Do Lists:\n\n";
+    for (const list of lists) {
+      const listName = getField(list, "name", "Name");
+      const listId = getField(list, "id", "Id");
+      out += `List: ${listName} (ID: ${listId})\n`;
+      
+      const items = getField(list, "items", "Items") ?? [];
+      if (!items || items.length === 0) {
+        out += "  No items yet.\n";
+      } else {
+        items.forEach((item: any, idx: number) => {
+          const status = getField(item, "isComplete", "IsComplete") ? "✓" : "○";
+          const itemName = getField(item, "name", "Name", "title", "Title");
+          const desc = getField(item, "description", "Description");
+          const itemId = getField(item, "id", "Id");
+          out += `  ${idx + 1}. [${status}] ${itemName} - ${desc} (ID: ${itemId})\n`;
+        });
+      }
+      out += "\n";
+    }
+
+    return successResponse(out);
+  }
+
+  // --- get_items: GET /api/items (optionally filter by listId)
+  if (name === "get_items") {
+    const { listId } = args as any;
+    let path = "/api/items";
+    if (listId !== undefined && listId !== null) {
+      path += `?listId=${encodeURIComponent(listId)}`;
+    }
+
+    const res = await apiFetch("GET", path);
+    if (!res.ok) {
+      const errText = res.message ?? JSON.stringify(res.body ?? res);
+      return errorResponse(`Error retrieving items: ${errText}`);
+    }
+
+    const items = res.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return successResponse("No items found.");
+    }
+
+    let out = "🗒️ Items:\n\n";
+    items.forEach((item) => {
+      const status = getField(item, "isComplete", "IsComplete") ? "✓" : "○";
+      const itemName = getField(item, "name", "Name", "title", "Title");
+      const desc = getField(item, "description", "Description");
+      const itemId = getField(item, "id", "Id");
+      out += `- [${status}] ${itemName} - ${desc} (ID: ${itemId})\n`;
+    });
+
+    return successResponse(out);
+  }
+
+  // --- get_item: GET /api/items/{id}
+  if (name === "get_item") {
+    const { itemId } = args as any;
+    if (!itemId) {
+      return errorResponse("Missing required field: itemId.");
+    }
+    
+    const res = await apiFetch("GET", `/api/items/${encodeURIComponent(itemId)}`);
+    if (!res.ok) {
+      const errText = res.message ?? JSON.stringify(res.body ?? res);
+      return errorResponse(`Error retrieving item: ${errText}`);
+    }
+
+    const item = res.body;
+    const id = getField(item, "id", "Id");
+    const name = getField(item, "name", "Name", "title", "Title");
+    const desc = getField(item, "description", "Description");
+    const completed = getField(item, "isComplete", "IsComplete");
+    
+    return successResponse(
+      `ID: ${id}\nName: ${name}\nDescription: ${desc}\nCompleted: ${completed}`
+    );
+  }
+
+  // Unknown tool
+  throw new Error(`Unknown tool: ${name}`);
+});
+
+// Start server using stdio transport
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.log(`MCP server started. API base: ${API_BASE}`);
+}
+
+main().catch((err) => {
+  console.error("Error starting MCP server:", err);
+  process.exit(1);
 });
