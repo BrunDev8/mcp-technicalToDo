@@ -191,11 +191,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_items",
-        description: "Get all items or items in a specific list (optional listId).",
+        description: "Get all items or items in a specific list (optional listId), optionally filter by completion status.",
         inputSchema: {
           type: "object",
           properties: {
             listId: { type: "number", description: "Optional listId to filter items." },
+            isComplete: { type: "boolean", description: "Optional filter by completion status (true for completed, false for incomplete)." },
           },
         },
       },
@@ -287,7 +288,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return errorResponse("Missing required field: itemId.");
     }
 
-    const res = await apiFetch("PUT", `/api/items/${encodeURIComponent(itemId)}`, { IsComplete: true });
+    // First, fetch the current item
+    const getRes = await apiFetch("GET", `/api/items/${encodeURIComponent(itemId)}`);
+    if (!getRes.ok) {
+      const errText = getRes.message ?? JSON.stringify(getRes.body ?? getRes);
+      return errorResponse(`Error fetching item to complete: ${errText}`);
+    }
+
+    const currentItem = getRes.body;
+    
+    // Prepare the full payload with existing data
+    const payload = {
+      Name: getField(currentItem, "name", "Name", "title", "Title"),
+      Description: getField(currentItem, "description", "Description") ?? "",
+      ListId: getField(currentItem, "listId", "ListId"),
+      IsComplete: true
+    };
+
+    // Now update with complete data
+    const res = await apiFetch("PUT", `/api/items/${encodeURIComponent(itemId)}`, payload);
     if (!res.ok) {
       const errText = res.message ?? JSON.stringify(res.body ?? res);
       return errorResponse(`Error completing item: ${errText}`);
@@ -373,12 +392,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return successResponse(out);
   }
 
-  // --- get_items: GET /api/items (optionally filter by listId)
+  // --- get_items: GET /api/items (optionally filter by listId and/or isComplete)
   if (name === "get_items") {
-    const { listId } = args as any;
+    const { listId, isComplete } = args as any;
     let path = "/api/items";
+    const queryParams: string[] = [];
+    
     if (listId !== undefined && listId !== null) {
-      path += `?listId=${encodeURIComponent(listId)}`;
+      queryParams.push(`listId=${encodeURIComponent(listId)}`);
+    }
+    if (isComplete !== undefined && isComplete !== null) {
+      queryParams.push(`isComplete=${encodeURIComponent(isComplete)}`);
+    }
+    
+    if (queryParams.length > 0) {
+      path += `?${queryParams.join('&')}`;
     }
 
     const res = await apiFetch("GET", path);
@@ -387,13 +415,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return errorResponse(`Error retrieving items: ${errText}`);
     }
 
-    const items = res.body;
-    if (!Array.isArray(items) || items.length === 0) {
+    let items = res.body;
+    if (!Array.isArray(items)) {
+      return errorResponse("Unexpected response format: expected an array of items.");
+    }
+    
+    // Client-side filtering as fallback if API doesn't support query params
+    if (isComplete !== undefined && isComplete !== null) {
+      items = items.filter((item: any) => {
+        const itemComplete = getField(item, "isComplete", "IsComplete");
+        return itemComplete === isComplete;
+      });
+    }
+    
+    if (items.length === 0) {
       return successResponse("No items found.");
     }
 
     let out = "🗒️ Items:\n\n";
-    items.forEach((item) => {
+    items.forEach((item: any) => {
       const status = getField(item, "isComplete", "IsComplete") ? "✓" : "○";
       const itemName = getField(item, "name", "Name", "title", "Title");
       const desc = getField(item, "description", "Description");
