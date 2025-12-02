@@ -436,7 +436,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.log(`MCP server started. API base: ${API_BASE}`);
+  console.error(`MCP server started. API base: ${API_BASE}`);
 }
 
 main().catch((err) => {
